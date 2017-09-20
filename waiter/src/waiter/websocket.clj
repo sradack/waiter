@@ -361,5 +361,5 @@
   (log/error exception "error in processing websocket request")
   (track-process-error-metrics-fn descriptor)
   (async/go
-    (async/>! out (utils/exception->response request exception))
+    (async/>! out exception)
     (async/close! out)))

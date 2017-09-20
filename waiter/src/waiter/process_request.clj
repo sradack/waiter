@@ -452,11 +452,9 @@
        :status 303})
     (do
       (track-process-error-metrics-fn descriptor)
-      (let [{:keys [status] :as error-response} (utils/exception->response exception request)]
-        (when descriptor
-          (let [{:keys [service-description service-id]} descriptor]
-            (track-response-status-metrics service-id service-description status)))  
-        error-response))))
+      (when descriptor
+        (let [{:keys [service-description service-id]} descriptor]
+          (track-response-status-metrics service-id service-description (or (-> exception ex-data :status) 500)))))))
 
 (defn track-process-error-metrics
   "Updates metrics for process errors."
@@ -596,37 +594,31 @@
 (defn handle-suspended-service
   "Check if a service has been suspended and immediately return a 503 response"
   [request {:keys [suspended-state service-description service-id]}]
-  (try 
-    (when (get suspended-state :suspended false)
+  (when (get suspended-state :suspended false)
     (let [{:keys [last-updated-by time]} suspended-state
           response-map (cond-> {:service-id service-id}
-                               time (assoc :suspended-at (utils/date-to-str time))
-                               (not (str/blank? last-updated-by)) (assoc :last-updated-by last-updated-by))]
+                         time (assoc :suspended-at (utils/date-to-str time))
+                         (not (str/blank? last-updated-by)) (assoc :last-updated-by last-updated-by))]
       (log/info (:message response-map) (dissoc response-map :message))
       (track-response-status-metrics service-id service-description 503)
       (throw (ex-info "Service has been suspended" 
-                      (assoc response-map :status 503)))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+                      (assoc response-map :status 503))))))
 
 (defn handle-too-many-requests
   "Check if a service has more pending requests than max-queue-length and immediately return a 503"
   [request {:keys [service-id service-description]}]
-  (try 
-    (let [max-queue-length (get service-description "max-queue-length")
-          current-queue-length (counters/value (metrics/service-counter service-id "request-counts" "waiting-for-available-instance"))]
-      (when (> current-queue-length max-queue-length)
-        (let [outstanding-requests (counters/value (metrics/service-counter service-id "request-counts" "outstanding"))
-              response-map {:max-queue-length max-queue-length
-                            :current-queue-length current-queue-length
-                            :outstanding-requests outstanding-requests
-                            :service-id service-id}]
-          (log/info (:message response-map) (dissoc response-map :message))
-          (track-response-status-metrics service-id service-description 503)
-          (throw (ex-info "Max queue length exceeded"
-                          (assoc response-map :status 503))))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [max-queue-length (get service-description "max-queue-length")
+        current-queue-length (counters/value (metrics/service-counter service-id "request-counts" "waiting-for-available-instance"))]
+    (when (> current-queue-length max-queue-length)
+      (let [outstanding-requests (counters/value (metrics/service-counter service-id "request-counts" "outstanding"))
+            response-map {:max-queue-length max-queue-length
+                          :current-queue-length current-queue-length
+                          :outstanding-requests outstanding-requests
+                          :service-id service-id}]
+        (log/info (:message response-map) (dissoc response-map :message))
+        (track-response-status-metrics service-id service-description 503)
+        (throw (ex-info "Max queue length exceeded"
+                        (assoc response-map :status 503)))))))
 
 (defn request-authorized?
   "Takes the request w/ kerberos auth info & the app headers, and returns true if the user is allowed to use "

@@ -18,6 +18,7 @@
             [clojure.tools.logging :as log]
             [clojure.walk :as walk]
             [comb.template :as template]
+            [full.async :as fa]
             [metrics.counters :as counters]
             [metrics.meters :as meters]
             [plumbing.core :as pc]
@@ -69,34 +70,27 @@
 (defn complete-async-handler
   "Completes execution of an async request by propagating a termination message to the request monitor system."
   [async-request-terminate-fn src-router-id {:keys [route-params uri] :as request}]
-  (try
-    (let [{:keys [request-id service-id]} route-params]
-      (when (str/blank? service-id)
-        (throw (ex-info "No service-id specified" {:src-router-id src-router-id, :status 400, :uri uri})))
-      (when (str/blank? request-id)
-        (throw (ex-info "No request-id specified" {:src-router-id src-router-id, :status 400, :uri uri})))
-      (let [succeeded (async-request-terminate-fn request-id)]
-        (utils/map->json-response {:request-id request-id, :success succeeded})))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [{:keys [request-id service-id]} route-params]
+    (when (str/blank? service-id)
+      (throw (ex-info "No service-id specified" {:src-router-id src-router-id, :status 400, :uri uri})))
+    (when (str/blank? request-id)
+      (throw (ex-info "No request-id specified" {:src-router-id src-router-id, :status 400, :uri uri})))
+    (let [succeeded (async-request-terminate-fn request-id)]
+      (utils/map->json-response {:request-id request-id, :success succeeded}))))
 
 (defn async-result-handler
   "Result handler for async requests. Supports any http method.
    The router delegates the call to the backend and it notifies the 'host' router to treat the async request as complete."
   [async-trigger-terminate-fn make-http-request-fn service-id->service-description-fn
    {:keys [request-method route-params] :as request}]
-  (async/go
-    (try
-      (let [{:keys [request-id router-id service-id]} route-params
-            {:keys [error status] :as backend-response}
-            (async/<! (async-make-http-request "async-result" make-http-request-fn service-id->service-description-fn request))]
-        (log/info "http" request-method "returned status" status)
-        (async-trigger-terminate-fn router-id service-id request-id)
-        (when error (throw error))
-        backend-response)
-      (catch Exception ex
-        (log/error ex "error in retrieving result of async request")
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (let [{:keys [request-id router-id service-id]} route-params
+          {:keys [error status] :as backend-response}
+          (async/<! (async-make-http-request "async-result" make-http-request-fn service-id->service-description-fn request))]
+      (log/info "http" request-method "returned status" status)
+      (async-trigger-terminate-fn router-id service-id request-id)
+      (when error (throw error))
+      backend-response)))
 
 (defn async-status-handler
   "Status handler for async requests. Supports both delete and get http methods.
@@ -105,164 +99,146 @@
    If the router determines that the request has completed, it notifies the 'host' router to treat the async request as complete."
   [async-trigger-terminate-fn make-http-request-fn service-id->service-description-fn
    {:keys [request-method route-params] :as request}]
-  (async/go
-    (try
-      (let [{:keys [host location port request-id router-id service-id]} route-params
-            {:keys [error status] :as backend-response}
-            (async/<! (async-make-http-request "async-status" make-http-request-fn service-id->service-description-fn request))]
-        (when error (throw error))
-        (let [{:strs [backend-proto]} (service-id->service-description-fn service-id)
-              endpoint (scheduler/end-point-url {:host host :port port :protocol backend-proto} location)
-              location-header (get-in backend-response [:headers "location"])
-              location-url (async-req/normalize-location-header endpoint location-header)
-              relative-location? (str/starts-with? (str location-url) "/")]
-          (when (or (and (= request-method :get)
-                         (or (and (= 303 status) (not relative-location?))
-                             (= 410 status)))
-                    (and (= request-method :delete)
-                         (or (= 200 status)
-                             (= 204 status))))
-            (async-trigger-terminate-fn router-id service-id request-id))
-          (if (and (= request-method :get) (= 303 status) relative-location?)
-            (let [result-location (async-req/route-params->uri "/waiter-async/result/" (assoc route-params :location location-url))]
-              (assoc-in backend-response [:headers "location"] result-location))
-            backend-response)))
-      (catch Exception ex
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (let [{:keys [host location port request-id router-id service-id]} route-params
+          {:keys [error status] :as backend-response}
+          (async/<! (async-make-http-request "async-status" make-http-request-fn service-id->service-description-fn request))]
+      (when error (throw error))
+      (let [{:strs [backend-proto]} (service-id->service-description-fn service-id)
+            endpoint (scheduler/end-point-url {:host host :port port :protocol backend-proto} location)
+            location-header (get-in backend-response [:headers "location"])
+            location-url (async-req/normalize-location-header endpoint location-header)
+            relative-location? (str/starts-with? (str location-url) "/")]
+        (when (or (and (= request-method :get)
+                       (or (and (= 303 status) (not relative-location?))
+                           (= 410 status)))
+                  (and (= request-method :delete)
+                       (or (= 200 status)
+                           (= 204 status))))
+          (async-trigger-terminate-fn router-id service-id request-id))
+        (if (and (= request-method :get) (= 303 status) relative-location?)
+          (let [result-location (async-req/route-params->uri "/waiter-async/result/" (assoc route-params :location location-url))]
+            (assoc-in backend-response [:headers "location"] result-location))
+          backend-response)))))
 
 (defn blacklist-instance
   [instance-rpc-chan request]
-  (async/go
-    (try
-      (let [request-body (slurp (:body request))
-            {:strs [instance period-in-ms reason] :as request-body-map} (json/read-str request-body)
-            instance-id (get instance "id")
-            service-id (get instance "service-id")]
-        (if (or (str/blank? reason)
-                (str/blank? instance-id)
-                (str/blank? service-id)
-                (or (not (integer? period-in-ms)) (neg? period-in-ms)))
-          (throw (ex-info "Must provide the service-id, the instance id, the reason, and a positive period"
-                          {:input-data request-body-map
-                           :status 400}))
-          (let [response-chan (async/promise-chan)
-                _ (service/blacklist-instance! instance-rpc-chan service-id instance-id period-in-ms response-chan)
-                _ (log/info "Waiting for response from blacklist channel...")
-                response-code (async/alt!
-                                response-chan ([code] code)
-                                (async/timeout (-> 30 t/seconds t/in-millis)) ([_] :timeout)
-                                :priority true)
-                successful? (= response-code :blacklisted)]
-            (cid/cloghelper
-              (if successful? :info :warn)
-              "Blacklist" instance-id "of" service-id "response:" (name response-code))
-            (if successful?
-              (do
-                (when (= "killed" reason)
-                  (scheduler/process-instance-killed! (walk/keywordize-keys instance)))
-                (utils/map->json-response {:instance-id instance-id
-                                           :blacklist-period period-in-ms}))
-              (let [response-status (if (= :in-use response-code) 423 503)]
-                (utils/map->json-response {:message "Unable to blacklist instance."
-                                           :instance-id instance-id
-                                           :reason response-code}
-                                          :status response-status))))))
-      (catch Exception ex
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (let [request-body (slurp (:body request))
+          {:strs [instance period-in-ms reason] :as request-body-map} (json/read-str request-body)
+          instance-id (get instance "id")
+          service-id (get instance "service-id")]
+      (if (or (str/blank? reason)
+              (str/blank? instance-id)
+              (str/blank? service-id)
+              (or (not (integer? period-in-ms)) (neg? period-in-ms)))
+        (throw (ex-info "Must provide the service-id, the instance id, the reason, and a positive period"
+                        {:input-data request-body-map
+                         :status 400}))
+        (let [response-chan (async/promise-chan)
+              _ (service/blacklist-instance! instance-rpc-chan service-id instance-id period-in-ms response-chan)
+              _ (log/info "Waiting for response from blacklist channel...")
+              response-code (async/alt!
+                              response-chan ([code] code)
+                              (async/timeout (-> 30 t/seconds t/in-millis)) ([_] :timeout)
+                              :priority true)
+              successful? (= response-code :blacklisted)]
+          (cid/cloghelper
+            (if successful? :info :warn)
+            "Blacklist" instance-id "of" service-id "response:" (name response-code))
+          (if successful?
+            (do
+              (when (= "killed" reason)
+                (scheduler/process-instance-killed! (walk/keywordize-keys instance)))
+              (utils/map->json-response {:instance-id instance-id
+                                         :blacklist-period period-in-ms}))
+            (let [response-status (if (= :in-use response-code) 423 503)]
+              (utils/map->json-response {:message "Unable to blacklist instance."
+                                         :instance-id instance-id
+                                         :reason response-code}
+                                        :status response-status))))))))
 
 (defn get-blacklisted-instances
   "Return the blacklisted instances for a given service-id at this router."
   [instance-rpc-chan service-id request]
-  (async/go
-    (try
-      (when (str/blank? service-id)
-        (throw (ex-info "Missing service-id" {:status 400})))
-      (let [response-chan (async/promise-chan)
-            _ (service/query-instance! instance-rpc-chan service-id response-chan)
-            _ (log/info "Waiting for response from query-state channel...")
-            current-state (async/alt!
-                            response-chan ([state] state)
-                            (async/timeout (-> 30 t/seconds t/in-millis)) ([_] {})
-                            :priority true)
-            blacklisted-instances (vec (keys (:instance-id->blacklist-expiry-time current-state)))]
-        (log/info service-id "has" (count blacklisted-instances) "blacklisted instance(s).")
-        (utils/map->json-response {:blacklisted-instances blacklisted-instances}))
-      (catch Exception ex
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (when (str/blank? service-id)
+      (throw (ex-info "Missing service-id" {:status 400})))
+    (let [response-chan (async/promise-chan)
+          _ (service/query-instance! instance-rpc-chan service-id response-chan)
+          _ (log/info "Waiting for response from query-state channel...")
+          current-state (async/alt!
+                          response-chan ([state] state)
+                          (async/timeout (-> 30 t/seconds t/in-millis)) ([_] {})
+                          :priority true)
+          blacklisted-instances (vec (keys (:instance-id->blacklist-expiry-time current-state)))]
+      (log/info service-id "has" (count blacklisted-instances) "blacklisted instance(s).")
+      (utils/map->json-response {:blacklisted-instances blacklisted-instances}))))
 
 (defn metrics-request-handler
   "Retrieves the codahale metrics for a service-id present at this router."
   [request]
-  (try
-    (let [request-params (:params (ring-params/params-request request))
-          exclude-services (utils/request-flag request-params "exclude-services")
-          service-id (get request-params "service-id" nil)
-          include-jvm-metrics (utils/request-flag request-params "include-jvm-metrics")
-          metrics (cond
-                    exclude-services (metrics/get-waiter-metrics)
-                    (and (not exclude-services) service-id) (metrics/get-service-metrics service-id)
-                    include-jvm-metrics (metrics/get-jvm-metrics)
-                    :else (metrics/get-metrics))]
-      (utils/map->streaming-json-response metrics))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [request-params (:params (ring-params/params-request request))
+        exclude-services (utils/request-flag request-params "exclude-services")
+        service-id (get request-params "service-id" nil)
+        include-jvm-metrics (utils/request-flag request-params "include-jvm-metrics")
+        metrics (cond
+                  exclude-services (metrics/get-waiter-metrics)
+                  (and (not exclude-services) service-id) (metrics/get-service-metrics service-id)
+                  include-jvm-metrics (metrics/get-jvm-metrics)
+                  :else (metrics/get-metrics))]
+    (utils/map->streaming-json-response metrics)))
 
 (defn service-name-handler
   "Retrieves the app-name of the service specified by the request."
   [request request->descriptor-fn kv-store store-service-description-fn]
-  (try
-    (let [{:keys [service-id core-service-description]} (request->descriptor-fn request)]
-      (when (not= core-service-description (sd/fetch-core kv-store service-id))
-        ; eagerly store the service description for this service-id
-        (store-service-description-fn service-id core-service-description))
-      {:body service-id
-       :status 200})
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [{:keys [service-id core-service-description]} (request->descriptor-fn request)]
+    (when (not= core-service-description (sd/fetch-core kv-store service-id))
+      ; eagerly store the service description for this service-id
+      (store-service-description-fn service-id core-service-description))
+    {:body service-id
+     :status 200}))
 
 (defn list-services-handler
   "Retrieves the list of services viewable by the currently logged in user.
    A service is viewable by the run-as-user or a waiter super-user."
   [entitlement-manager state-chan prepend-waiter-url service-id->service-description-fn request]
-  (try
-    (let [timeout-ms 30000
-          current-state (async/alt!!
-                          state-chan ([state-data] state-data)
-                          (async/timeout timeout-ms) ([_] :timeout)
-                          :priority true)]
-      (if (= :timeout current-state)
-        (throw (ex-info "Query for service state timed out" {:status 503}))
-        (let [request-params (:params (ring-params/params-request request))
-              auth-user (get request :authorization/user)
-              run-as-user-param (get request-params "run-as-user")
-              viewable-services (filter
-                                  #(let [{:strs [run-as-user] :as service-description} (service-id->service-description-fn % :effective? false)]
-                                     (and service-description
-                                          (if run-as-user-param
-                                            (= run-as-user run-as-user-param)
-                                            (authz/manage-service? entitlement-manager auth-user % service-description))))
-                                  (->> (concat (keys (:service-id->healthy-instances current-state))
-                                               (keys (:service-id->unhealthy-instances current-state)))
-                                       (apply sorted-set)))
-              retrieve-instance-counts (fn retrieve-instance-counts [service-id]
-                                         {:healthy-instances (count (get-in current-state [:service-id->healthy-instances service-id]))
-                                          :unhealthy-instances (count (get-in current-state [:service-id->unhealthy-instances service-id]))})
-              include-effective-parameters? (utils/request-flag request-params "effective-parameters")
-              response-data (map
-                             (fn service-id->service-info [service-id]
-                               (let [service-description (service-id->service-description-fn service-id :effective? false)]
-                                 (cond->
-                                     {:service-id service-id
-                                      :service-description service-description
-                                      :instance-counts (retrieve-instance-counts service-id)
-                                      :url (prepend-waiter-url (str "/apps/" service-id))}
-                                   include-effective-parameters? (assoc :effective-parameters
-                                                                        (service-id->service-description-fn
+  (let [timeout-ms 30000
+        current-state (async/alt!!
+                        state-chan ([state-data] state-data)
+                        (async/timeout timeout-ms) ([_] :timeout)
+                        :priority true)]
+    (if (= :timeout current-state)
+      (throw (ex-info "Query for service state timed out" {:status 503}))
+      (let [request-params (:params (ring-params/params-request request))
+            auth-user (get request :authorization/user)
+            run-as-user-param (get request-params "run-as-user")
+            viewable-services (filter
+                                #(let [{:strs [run-as-user] :as service-description} (service-id->service-description-fn % :effective? false)]
+                                   (and service-description
+                                        (if run-as-user-param
+                                          (= run-as-user run-as-user-param)
+                                          (authz/manage-service? entitlement-manager auth-user % service-description))))
+                                (->> (concat (keys (:service-id->healthy-instances current-state))
+                                             (keys (:service-id->unhealthy-instances current-state)))
+                                     (apply sorted-set)))
+            retrieve-instance-counts (fn retrieve-instance-counts [service-id]
+                                       {:healthy-instances (count (get-in current-state [:service-id->healthy-instances service-id]))
+                                        :unhealthy-instances (count (get-in current-state [:service-id->unhealthy-instances service-id]))})
+            include-effective-parameters? (utils/request-flag request-params "effective-parameters")
+            response-data (map
+                            (fn service-id->service-info [service-id]
+                              (let [service-description (service-id->service-description-fn service-id :effective? false)]
+                                (cond->
+                                  {:service-id service-id
+                                   :service-description service-description
+                                   :instance-counts (retrieve-instance-counts service-id)
+                                   :url (prepend-waiter-url (str "/apps/" service-id))}
+                                  include-effective-parameters? (assoc :effective-parameters
+                                                                       (service-id->service-description-fn
                                                                          service-id :effective? true)))))
-                             viewable-services)]
-          (utils/map->streaming-json-response response-data))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+                            viewable-services)]
+        (utils/map->streaming-json-response response-data)))))
 
 (defn delete-service-handler
   "Deletes the service from the scheduler (after authorization checks)."
@@ -358,18 +334,15 @@
      :delete deletes the service from the scheduler (after authorization checks).
      :get returns details about the service such as the service description, metrics, instances, etc."
   [router-id service-id scheduler kv-store allowed-to-manage-service?-fn prepend-waiter-url make-inter-router-requests-fn request]
-  (try
-    (when (not service-id)
-      (throw (ex-info "Missing service-id" {:status 400})))
-    (let [core-service-description (sd/fetch-core kv-store service-id :refresh true)]
-      (if (empty? core-service-description)
-        (throw (ex-info "Service not found" {:status 404 :service-id service-id}))
-        (case (:request-method request)
-          :delete (delete-service-handler service-id core-service-description scheduler allowed-to-manage-service?-fn request)
-          :get (get-service-handler router-id service-id core-service-description scheduler kv-store
-                                    prepend-waiter-url make-inter-router-requests-fn))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (when (not service-id)
+    (throw (ex-info "Missing service-id" {:status 400})))
+  (let [core-service-description (sd/fetch-core kv-store service-id :refresh true)]
+    (if (empty? core-service-description)
+      (throw (ex-info "Service not found" {:status 404 :service-id service-id}))
+      (case (:request-method request)
+        :delete (delete-service-handler service-id core-service-description scheduler allowed-to-manage-service?-fn request)
+        :get (get-service-handler router-id service-id core-service-description scheduler kv-store
+                                  prepend-waiter-url make-inter-router-requests-fn)))))
 
 (defn- trigger-service-refresh
   "Makes interrouter calls to refresh service caches in kv-store."
@@ -379,184 +352,166 @@
 (defn suspend-or-resume-service-handler
   "Suspend/Resume a service after performing run-as-user/waiter-user validation."
   [kv-store allowed-to-manage-service? make-inter-router-requests-fn service-id mode request]
-  (try
-    (when (str/blank? service-id)
-      (throw (ex-info "Missing service-id" {:status 400})))
-    ; throw exception if no service description for service-id exists
-    (sd/fetch-core kv-store service-id :nil-on-missing? false)
-    (let [auth-user (get request :authorization/user)
-          mode-str (name mode)]
-      (log/info auth-user "wants to" mode-str " " service-id)
-      (if (allowed-to-manage-service? service-id auth-user)
-        (do
-          (cond
-            (= :suspend mode) (sd/suspend-service kv-store service-id auth-user)
-            (= :resume mode) (sd/resume-service kv-store service-id auth-user)
-            :else (log/info "unsupported mode:" mode-str))
-          (let [success (contains? #{:suspend :resume} mode)]
-            ; refresh state on routers
-            (trigger-service-refresh make-inter-router-requests-fn service-id)
-            (utils/map->json-response {:action mode-str
-                                       :service-id service-id
-                                       :success success})))
-        (throw (ex-info (str auth-user " not allowed to modify " service-id)
-                        {:auth-user auth-user
-                         :service-id service-id
-                         :status 403}))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (when (str/blank? service-id)
+    (throw (ex-info "Missing service-id" {:status 400})))
+  ; throw exception if no service description for service-id exists
+  (sd/fetch-core kv-store service-id :nil-on-missing? false)
+  (let [auth-user (get request :authorization/user)
+        mode-str (name mode)]
+    (log/info auth-user "wants to" mode-str " " service-id)
+    (if (allowed-to-manage-service? service-id auth-user)
+      (do
+        (cond
+          (= :suspend mode) (sd/suspend-service kv-store service-id auth-user)
+          (= :resume mode) (sd/resume-service kv-store service-id auth-user)
+          :else (log/info "unsupported mode:" mode-str))
+        (let [success (contains? #{:suspend :resume} mode)]
+          ; refresh state on routers
+          (trigger-service-refresh make-inter-router-requests-fn service-id)
+          (utils/map->json-response {:action mode-str
+                                     :service-id service-id
+                                     :success success})))
+      (throw (ex-info (str auth-user " not allowed to modify " service-id)
+                      {:auth-user auth-user
+                       :service-id service-id
+                       :status 403})))))
 
 (defn override-service-handler
   "Handles overrides for a service."
   [kv-store allowed-to-manage-service? make-inter-router-requests-fn service-id request]
-  (try
-    (when (str/blank? service-id)
-      (throw (ex-info "Missing service-id" {:status 400})))
-    ; throw exception if no service description for service-id exists
-    (sd/fetch-core kv-store service-id :nil-on-missing? false)
-    (case (:request-method request)
-      :delete
-      (let [auth-user (get request :authorization/user)]
-        (log/info auth-user "wants to delete overrides for" service-id)
-        (if (allowed-to-manage-service? service-id auth-user)
-          (do
-            (sd/clear-service-description-overrides kv-store service-id auth-user)
-            (trigger-service-refresh make-inter-router-requests-fn service-id)
-            (utils/map->json-response {:service-id service-id, :success true}))
-          (throw (ex-info (str auth-user " not allowed to override " service-id)
-                          {:auth-user auth-user
-                           :service-id service-id
-                           :status 403}))))
-      :post
-      (let [auth-user (get request :authorization/user)]
-        (log/info auth-user "wants to update overrides for" service-id)
-        (if (allowed-to-manage-service? service-id auth-user)
-          (do
-            (let [service-description-overrides (json/read-str (slurp (:body request)))]
-              (sd/store-service-description-overrides kv-store service-id auth-user service-description-overrides))
-            (trigger-service-refresh make-inter-router-requests-fn service-id)
-            (utils/map->json-response {:service-id service-id, :success true}))
-          (throw (ex-info (str auth-user " not allowed to override " service-id)
-                          {:auth-user auth-user
-                           :service-id service-id
-                           :status 403})))))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (when (str/blank? service-id)
+    (throw (ex-info "Missing service-id" {:status 400})))
+  ; throw exception if no service description for service-id exists
+  (sd/fetch-core kv-store service-id :nil-on-missing? false)
+  (case (:request-method request)
+    :delete
+    (let [auth-user (get request :authorization/user)]
+      (log/info auth-user "wants to delete overrides for" service-id)
+      (if (allowed-to-manage-service? service-id auth-user)
+        (do
+          (sd/clear-service-description-overrides kv-store service-id auth-user)
+          (trigger-service-refresh make-inter-router-requests-fn service-id)
+          (utils/map->json-response {:service-id service-id, :success true}))
+        (throw (ex-info (str auth-user " not allowed to override " service-id)
+                        {:auth-user auth-user
+                         :service-id service-id
+                         :status 403}))))
+    :post
+    (let [auth-user (get request :authorization/user)]
+      (log/info auth-user "wants to update overrides for" service-id)
+      (if (allowed-to-manage-service? service-id auth-user)
+        (do
+          (let [service-description-overrides (json/read-str (slurp (:body request)))]
+            (sd/store-service-description-overrides kv-store service-id auth-user service-description-overrides))
+          (trigger-service-refresh make-inter-router-requests-fn service-id)
+          (utils/map->json-response {:service-id service-id, :success true}))
+        (throw (ex-info (str auth-user " not allowed to override " service-id)
+                        {:auth-user auth-user
+                         :service-id service-id
+                         :status 403}))))))
 
 (defn service-view-logs-handler
   "Redirects user to the log directory on the slave"
   [scheduler service-id prepend-waiter-url request]
-  (try
-    (let [{:strs [instance-id host directory]} (:params (ring-params/params-request request))
-          _ (when-not instance-id
-              (throw (ex-info "Missing instance-id parameter" {:status 400})))
-          _ (when-not host
-              (throw (ex-info "Missing host parameter" {:status 400})))
-          _ (when-not directory
-              (throw (ex-info "Missing directory parameter" {:status 400})))
-          directory-content (map (fn [{:keys [path type] :as entry}]
-                                   (if (= type "file")
-                                     entry
-                                     (-> (dissoc entry :path)
-                                         (assoc :url (generate-log-url prepend-waiter-url
-                                                                       {:directory path
-                                                                        :host host
-                                                                        :id instance-id
-                                                                        :service-id service-id})))))
-                                 (scheduler/retrieve-directory-content scheduler service-id instance-id host directory))]
-      (utils/map->json-response (vec directory-content)))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [{:strs [instance-id host directory]} (:params (ring-params/params-request request))
+        _ (when-not instance-id
+            (throw (ex-info "Missing instance-id parameter" {:status 400})))
+        _ (when-not host
+            (throw (ex-info "Missing host parameter" {:status 400})))
+        _ (when-not directory
+            (throw (ex-info "Missing directory parameter" {:status 400})))
+        directory-content (map (fn [{:keys [path type] :as entry}]
+                                 (if (= type "file")
+                                   entry
+                                   (-> (dissoc entry :path)
+                                       (assoc :url (generate-log-url prepend-waiter-url
+                                                                     {:directory path
+                                                                      :host host
+                                                                      :id instance-id
+                                                                      :service-id service-id})))))
+                               (scheduler/retrieve-directory-content scheduler service-id instance-id host directory))]
+    (utils/map->json-response (vec directory-content))))
 
 (defn work-stealing-handler
   "Handles work-stealing offers of instances for load-balancing work on the current router."
   [instance-rpc-chan request]
-  (async/go
-    (try
-      (let [{:keys [cid instance request-id router-id service-id] :as request-body-map}
-            (-> request (:body) (slurp) (json/read-str) (walk/keywordize-keys))]
-        (log/info "received work-stealing offer" (:id instance) "of" service-id "from" router-id)
-        (if-not (and cid instance request-id router-id service-id)
-          (throw (ex-info "Missing one of cid, instance, request-id, router-id or service-id" 
-                          (assoc request-body-map :status 400)))
-          (let [response-chan (async/promise-chan)
-                offer-params {:cid cid
-                              :instance (scheduler/make-ServiceInstance instance)
-                              :request-id request-id
-                              :response-chan response-chan
-                              :router-id router-id
-                              :service-id service-id}]
-            (service/offer-instance! instance-rpc-chan service-id offer-params)
-            (let [response-status (async/<! response-chan)]
-              (utils/map->json-response (assoc (select-keys offer-params [:cid :request-id :router-id :service-id])
-                                               :response-status response-status))))))
-      (catch Exception ex
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (let [{:keys [cid instance request-id router-id service-id] :as request-body-map}
+          (-> request (:body) (slurp) (json/read-str) (walk/keywordize-keys))]
+      (log/info "received work-stealing offer" (:id instance) "of" service-id "from" router-id)
+      (if-not (and cid instance request-id router-id service-id)
+        (throw (ex-info "Missing one of cid, instance, request-id, router-id or service-id" 
+                        (assoc request-body-map :status 400)))
+        (let [response-chan (async/promise-chan)
+              offer-params {:cid cid
+                            :instance (scheduler/make-ServiceInstance instance)
+                            :request-id request-id
+                            :response-chan response-chan
+                            :router-id router-id
+                            :service-id service-id}]
+          (service/offer-instance! instance-rpc-chan service-id offer-params)
+          (let [response-status (async/<! response-chan)]
+            (utils/map->json-response (assoc (select-keys offer-params [:cid :request-id :router-id :service-id])
+                                             :response-status response-status))))))))
 
 (defn get-router-state
   "Outputs the state of the router as json."
   [state-chan scheduler-chan router-metrics-state-fn kv-store leader?-fn scheduler request]
-  (try
-    (let [timeout-ms 30000
-          current-state (async/alt!!
-                          state-chan ([state-data] state-data)
-                          (async/timeout timeout-ms) ([_] {:message "Query for router state timed out"})
-                          :priority true)
-          scheduler-state (let [response-chan (async/promise-chan)]
-                            (async/>!! scheduler-chan {:response-chan response-chan})
-                            (async/alt!!
-                              response-chan ([state] state)
-                              (async/timeout timeout-ms) ([_] {:message "Query for scheduler state timed out"})
-                              :priority true))]
-      (-> current-state
-          (assoc :leader (leader?-fn)
-                 :kv-store (kv/state kv-store)
-                 :router-metrics-state (router-metrics-state-fn)
-                 :scheduler scheduler-state
-                 :statsd (statsd/state))
-          (utils/map->streaming-json-response)))
-    (catch Exception ex
-      (utils/exception->response ex request))))
+  (let [timeout-ms 30000
+        current-state (async/alt!!
+                        state-chan ([state-data] state-data)
+                        (async/timeout timeout-ms) ([_] {:message "Query for router state timed out"})
+                        :priority true)
+        scheduler-state (let [response-chan (async/promise-chan)]
+                          (async/>!! scheduler-chan {:response-chan response-chan})
+                          (async/alt!!
+                            response-chan ([state] state)
+                            (async/timeout timeout-ms) ([_] {:message "Query for scheduler state timed out"})
+                            :priority true))]
+    (-> current-state
+        (assoc :leader (leader?-fn)
+               :kv-store (kv/state kv-store)
+               :router-metrics-state (router-metrics-state-fn)
+               :scheduler scheduler-state
+               :statsd (statsd/state))
+        (utils/map->streaming-json-response))))
 
 (defn get-service-state
   "Retrieves the state for a particular service on the router."
   [router-id instance-rpc-chan service-id query-chans request]
-  (async/go
-    (try
-      (if (str/blank? service-id)
-        (throw (ex-info "Missing service-id" {:status 400}))
-        (let [timeout-ms (-> 10 t/seconds t/in-millis)
-              _ (log/info "waiting for response from query-state channel...")
-              responder-state-chan (service/query-maintainer-channel-map-with-timeout! instance-rpc-chan service-id timeout-ms :query-state)
-              _ (log/info "waiting for response from query-work-stealing channel...")
-              work-stealing-state-chan (service/query-maintainer-channel-map-with-timeout! instance-rpc-chan service-id timeout-ms :query-work-stealing)
-              [query-chans initial-result]
-              (loop [[[entry-key entry-value] & remaining] [[:responder-state responder-state-chan]
-                                                            [:work-stealing-state work-stealing-state-chan]]
-                     query-chans query-chans
-                     initial-result {}]
-                (if entry-key
-                  (if (map? entry-value)
-                    (recur remaining query-chans (assoc initial-result entry-key entry-value))
-                    (recur remaining (assoc query-chans entry-key entry-value) initial-result))
-                  [query-chans initial-result]))
-              query-chans-state (loop [[[key query-response-or-chan] & remaining] (seq query-chans)
-                                       result initial-result]
-                                  (if (and key query-response-or-chan)
-                                    (let [state (let [response-chan (async/promise-chan)]
-                                                  (async/>! query-response-or-chan
-                                                            {:cid (cid/get-correlation-id)
-                                                             :response-chan response-chan
-                                                             :service-id service-id})
-                                                  (log/info (str "Waiting on response on " key " channel"))
-                                                  (async/alt!
-                                                    response-chan ([state] state)
-                                                    (async/timeout timeout-ms) ([_] {:message "Request timeout"})))]
-                                      (recur remaining (assoc result key state)))
-                                    result))]
-          (utils/map->streaming-json-response {:router-id router-id, :state (utils/deep-sort-map query-chans-state)})))
-      (catch Exception ex
-        (utils/exception->response ex request)))))
+  (fa/go-try
+    (if (str/blank? service-id)
+      (throw (ex-info "Missing service-id" {:status 400}))
+      (let [timeout-ms (-> 10 t/seconds t/in-millis)
+            _ (log/info "waiting for response from query-state channel...")
+            responder-state-chan (service/query-maintainer-channel-map-with-timeout! instance-rpc-chan service-id timeout-ms :query-state)
+            _ (log/info "waiting for response from query-work-stealing channel...")
+            work-stealing-state-chan (service/query-maintainer-channel-map-with-timeout! instance-rpc-chan service-id timeout-ms :query-work-stealing)
+            [query-chans initial-result]
+            (loop [[[entry-key entry-value] & remaining] [[:responder-state responder-state-chan]
+                                                          [:work-stealing-state work-stealing-state-chan]]
+                   query-chans query-chans
+                   initial-result {}]
+              (if entry-key
+                (if (map? entry-value)
+                  (recur remaining query-chans (assoc initial-result entry-key entry-value))
+                  (recur remaining (assoc query-chans entry-key entry-value) initial-result))
+                [query-chans initial-result]))
+            query-chans-state (loop [[[key query-response-or-chan] & remaining] (seq query-chans)
+                                     result initial-result]
+                                (if (and key query-response-or-chan)
+                                  (let [state (let [response-chan (async/promise-chan)]
+                                                (async/>! query-response-or-chan
+                                                          {:cid (cid/get-correlation-id)
+                                                           :response-chan response-chan
+                                                           :service-id service-id})
+                                                (log/info (str "Waiting on response on " key " channel"))
+                                                (async/alt!
+                                                  response-chan ([state] state)
+                                                  (async/timeout timeout-ms) ([_] {:message "Request timeout"})))]
+                                    (recur remaining (assoc result key state)))
+                                  result))]
+        (utils/map->streaming-json-response {:router-id router-id, :state (utils/deep-sort-map query-chans-state)})))))
 
 (defn acknowledge-consent-handler
   "Processes the acknowledgment to launch a service as the auth-user.
@@ -612,7 +567,7 @@
     (catch Exception ex
       (counters/inc! (metrics/waiter-counter "auto-run-as-requester" "approve-error"))
       (meters/mark! (metrics/waiter-meter "auto-run-as-requester" "approve-error"))
-      (utils/exception->response ex request))))
+      (throw ex))))
 
 (defn request-consent-handler
   "Displays the consent form and requests approval from user. The content is rendered from consent.html.
@@ -647,4 +602,4 @@
     (catch Exception ex
       (counters/inc! (metrics/waiter-counter "auto-run-as-requester" "form-error"))
       (meters/mark! (metrics/waiter-meter "auto-run-as-requester" "form-error"))
-      (utils/exception->response ex request))))
+      (throw ex))))

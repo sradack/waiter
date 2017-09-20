@@ -22,6 +22,7 @@
             [schema.core :as s]
             [waiter.core :as core]
             [waiter.correlation-id :as cid]
+            [waiter.error-handling :as error-handling]
             [waiter.settings :as settings]
             [waiter.utils :as utils])
   (:import clojure.core.async.impl.channels.ManyToManyChannel
@@ -71,12 +72,12 @@
                   (let [options (merge websocket-config
                                        {:ring-handler (-> (core/ring-handler-factory waiter-request?-fn handlers)
                                                           core/correlation-id-middleware
-                                                          (core/wrap-support-info support-info)
+                                                          (error-handling/wrap-error-handling support-info)
                                                           consume-request-stream)
                                         :websocket-acceptor websocket-request-authenticator
                                         :websocket-handler (-> (core/websocket-handler-factory handlers)
                                                                core/correlation-id-middleware
-                                                               (core/wrap-support-info support-info))
+                                                               (error-handling/wrap-error-handling support-info))
                                         :host host
                                         :join? false
                                         :max-threads 250

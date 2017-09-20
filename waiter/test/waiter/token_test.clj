@@ -15,6 +15,7 @@
             [clojure.test :refer :all]
             [waiter.authorization :as authz]
             [waiter.kv :as kv]
+            [waiter.error-handling :as error-handling]
             [waiter.service-description :as sd]
             [waiter.test-helpers :refer :all]
             [waiter.token :refer :all])
@@ -40,8 +41,10 @@
 
 (defn- run-handle-token-request
   [kv-store waiter-hostname entitlement-manager make-peer-requests-fn validate-service-description-fn request]
-  (handle-token-request clock synchronize-fn kv-store waiter-hostname entitlement-manager make-peer-requests-fn
-                        validate-service-description-fn request))
+  (let [handle-token-request-fn (-> handle-token-request
+                                    (error-handling/wrap-error-handling {}))]
+    (handle-token-request-fn clock synchronize-fn kv-store waiter-hostname entitlement-manager make-peer-requests-fn
+                             validate-service-description-fn request)))
 
 (deftest test-handle-token-request
   (with-redefs [sd/service-description->service-id (fn [prefix sd] (str prefix (hash (select-keys sd sd/service-description-keys))))]
@@ -58,7 +61,7 @@
                                  {:cmd "tc2", :cpus 2, :mem 400, :version "d1e2f3", :run-as-user "tu1", :permitted-user "tu3", :token token})
           service-id2 (sd/service-description->service-id service-id-prefix service-description2)
           waiter-hostname "waiter-hostname.app.example.com"
-          handle-list-tokens-request (wrap-handler-json-response handle-list-tokens-request)]
+          handle-list-tokens-request (-> handle-list-tokens-request wrap-handler-json-response (error-handling/wrap-error-handling {}))]
 
       (testing "delete:no-token-in-request"
         (let [{:keys [status body]}
@@ -730,7 +733,7 @@
                          (locking lock
                            (f)))
         kv-store (kv/->LocalKeyValueStore (atom {}))
-        handle-list-tokens-request (wrap-handler-json-response handle-list-tokens-request)]
+        handle-list-tokens-request (-> handle-list-tokens-request wrap-handler-json-response (error-handling/wrap-error-handling {}))]
     (store-service-description-for-token synchronize-fn kv-store "token1" {} {"owner" "owner1"})
     (store-service-description-for-token synchronize-fn kv-store "token2" {} {"owner" "owner1"})
     (store-service-description-for-token synchronize-fn kv-store "token3" {} {"owner" "owner2"})

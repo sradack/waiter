@@ -36,6 +36,7 @@
             [waiter.cors :as cors]
             [waiter.curator :as curator]
             [waiter.discovery :as discovery]
+            [waiter.error-handling :as error-handling]
             [waiter.handler :as handler]
             [waiter.headers :as headers]
             [waiter.kv :as kv]
@@ -162,14 +163,6 @@
                 (if (map? nested-response) ;; websocket responses may be another channel
                   (cid/ensure-correlation-id nested-response get-request-cid)
                   nested-response)))))))))
-
-(defn wrap-support-info
-  "Attaches support-info to the request."
-  [handler support-info]
-  (fn wrap-support-info-fn [request]
-    (-> request
-        (assoc :support-info support-info)
-        handler)))
 
 (defn- make-blacklist-request
   [make-inter-router-requests-fn blacklist-period-ms dest-router-id dest-endpoint {:keys [id] :as instance} reason]
@@ -887,10 +880,7 @@
                                        [:state cors-validator]]
                                 (let [{max-age :max-age} cors-config]
                                   (fn cors-preflight-handler-fn [request]
-                                    (try
-                                      (cors/preflight-handler cors-validator max-age request)
-                                      (catch Exception e
-                                        (utils/exception->response request "Error in CORS pre-flight handler" e))))))
+                                    (cors/preflight-handler cors-validator max-age request))))
    :default-websocket-handler-fn (pc/fnk [[:routines determine-priority-fn prepend-waiter-url request->descriptor-fn service-id->password-fn start-new-service-fn]
                                           [:settings instance-request-properties]
                                           [:state instance-rpc-chan passwords router-id websocket-client]]
