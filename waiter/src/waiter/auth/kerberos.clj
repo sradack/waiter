@@ -111,7 +111,7 @@
     (check-has-prestashed-tickets query-chan user service-id))
 
   (wrap-auth-handler [_ request-handler]
-    (spnego/require-gss request-handler password)))
+    (spnego/wrap-spnego request-handler password)))
 
 (defn kerberos-authenticator
   "Factory function for creating KerberosAuthenticator"

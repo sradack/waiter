@@ -13,6 +13,7 @@
             [clojure.data.codec.base64 :as b64]
             [clojure.test :refer :all]
             [taoensso.nippy :as nippy]
+            [waiter.async-utils :as au]
             [waiter.cookie-support :refer :all])
   (:import (clojure.lang ExceptionInfo)
            org.eclipse.jetty.util.UrlEncoded))
@@ -42,19 +43,27 @@
 
 (deftest test-add-encoded-cookie
   (let [cookie-attrs ";Max-Age=864000;Path=/"
-        user-cookie (str "user=" (UrlEncoded/encodeString "data:john") cookie-attrs)]
+        user-cookie (str "user=" (UrlEncoded/encodeString "data:john") cookie-attrs)
+        add-cookie-fn (fn [resp] (-> (add-encoded-cookie resp [:cached "password"] "user" "john" 10)
+                                     au/sync-response))]
     (with-redefs [b64/encode (fn [^String data-string] (.getBytes data-string))
                   nippy/freeze (fn [input _] (str "data:" input))]
-      (is (= {:headers {"set-cookie" user-cookie}}
-             (add-encoded-cookie {} [:cached "password"] "user" "john" 10)))
-      (is (= {:headers {"set-cookie" ["foo=bar" user-cookie]}}
-             (add-encoded-cookie {:headers {"set-cookie" "foo=bar"}} [:cached "password"] "user" "john" 10)))
-      (is (= {:headers {"set-cookie" ["foo=bar" "baz=quux" user-cookie]}}
-             (add-encoded-cookie {:headers {"set-cookie" ["foo=bar" "baz=quux"]}} [:cached "password"] "user" "john" 10)))
-      (let [response-chan (async/promise-chan)]
-        (async/>!! response-chan {})
+      (testing "sync"
         (is (= {:headers {"set-cookie" user-cookie}}
-               (async/<!! (add-encoded-cookie response-chan [:cached "password"] "user" "john" 10))))))))
+               (add-cookie-fn {})))
+        (is (= {:headers {"set-cookie" ["foo=bar" user-cookie]}}
+               (add-cookie-fn {:headers {"set-cookie" "foo=bar"}})))
+        (is (= {:headers {"set-cookie" ["foo=bar" "baz=quux" user-cookie]}}
+               (add-cookie-fn {:headers {"set-cookie" ["foo=bar" "baz=quux"]}}))))
+      (testing "async"
+        (is (= {:headers {"set-cookie" user-cookie}}
+               (add-cookie-fn (async/go {})))))
+      (testing "exception sync"
+        (is (= {:headers {"set-cookie" user-cookie}}
+               (ex-data (add-cookie-fn (ex-info "bad" {}))))))
+      (testing "exception async"
+        (is (= {:headers {"set-cookie" user-cookie}}
+               (ex-data (add-cookie-fn (async/go (ex-info "bad" {}))))))))))
 
 (deftest test-decode-cookie
   (with-redefs [b64/decode (fn [value-bytes] (String. ^bytes value-bytes "utf-8"))

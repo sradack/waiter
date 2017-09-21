@@ -19,6 +19,7 @@
             [clojure.tools.logging :as log]
             [comb.template :as template]
             [full.async :as fa]
+            [waiter.async-utils :as au]
             [waiter.utils :as utils]))
 
 (defn urls->html-links
@@ -79,8 +80,8 @@
                "application/json"
                (do
                  (json/write-str {:waiter-error error-context}
-                               :value-fn utils/stringify-elements
-                               :escape-slash false))
+                                 :value-fn utils/stringify-elements
+                                 :escape-slash false))
                "text/html"
                (template/eval (slurp (io/resource "web/error.html"))
                               (-> error-context 
@@ -103,14 +104,13 @@
   [handler support-info]
   (fn wrap-error-handling-fn [request]
     (try 
-      (let [ret (handler request)]
-        (cond (map? ret) ret
-              (nil? ret) nil
-              :else (async/go 
-                      (let [async-ret (async/<! ret)]
-                        (if (instance? Throwable async-ret)
-                          (exception->response async-ret support-info request)
-                          async-ret)))))
+      (let [resp (handler request)]
+        (if (au/chan? resp) (async/go
+                              (let [ret (async/<! resp)]
+                                (if (instance? Throwable ret)
+                                  (exception->response ret support-info request)
+                                  ret)))
+          resp))
       (catch Throwable ex
         (exception->response ex support-info request)))))
 

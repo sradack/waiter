@@ -19,15 +19,21 @@
   (let [username (System/getProperty "user.name")
         authenticator (one-user-authenticator {:run-as-user username})]
     (is (= :one-user (auth-type authenticator)))
-    (let [request-handler (wrap-auth-handler authenticator identity)
-          request {}
-          expected-request (assoc request
-                             :authorization/user username
-                             :authenticated-principal username)
-          actual-result (request-handler request)]
-      (is (= expected-request (dissoc actual-result :headers)))
-      (is (str/includes? (get-in actual-result [:headers "set-cookie"]) "x-waiter-auth="))
-      (is (nil? (check-user authenticator "user" "service-id"))))))
+    (testing "base"
+      (let [request-handler (wrap-auth-handler authenticator identity)
+            request {}
+            expected-request (assoc request
+                                    :authorization/user username
+                                    :authenticated-principal username)
+            actual-result (request-handler request)]
+        (is (= expected-request (dissoc actual-result :headers)))
+        (is (str/includes? (get-in actual-result [:headers "set-cookie"]) "x-waiter-auth="))
+        (is (nil? (check-user authenticator "user" "service-id")))))
+    (testing "exception"
+      (try
+        (wrap-auth-handler authenticator (fn [] (throw (ex-info "bad" {}))))
+        (catch Throwable t
+          (is (get-in t [:headers "set-cookie"])))))))
 
 (deftest test-get-auth-cookie-value
   (is (= "abc123" (get-auth-cookie-value "x-waiter-auth=abc123")))

@@ -970,13 +970,11 @@
                                                                   (partial router-comm-authenticated? router-id passwords))]
                                          (basic-auth-handler request))))
    :handle-secure-request-fn (pc/fnk [[:routines authentication-method-wrapper-fn]
-                                      [:state cors-validator]
-                                      wrap-error-handling-fn]
+                                      [:state cors-validator]]
                                (fn handle-secure-request-fn [request-handler {:keys [uri] :as request}]
                                  (log/debug "secure request received at" uri)
                                  (let [handler (-> request-handler
-                                                   wrap-error-handling-fn
-                                                   (cors/handler cors-validator)
+                                                   (cors/wrap-cors cors-validator)
                                                    authentication-method-wrapper-fn)]
                                    (handler request))))
    :kill-instance-handler-fn (pc/fnk [[:routines peers-acknowledged-blacklist-requests-fn]

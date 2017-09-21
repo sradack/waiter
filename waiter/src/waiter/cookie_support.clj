@@ -16,6 +16,7 @@
             [clojure.string :as str]
             [clojure.tools.logging :as log]
             [taoensso.nippy :as nippy]
+            [waiter.async-utils :as au]
             [waiter.utils :as utils])
   (:import clojure.lang.ExceptionInfo
            java.nio.charset.StandardCharsets
@@ -57,7 +58,7 @@
 (defn add-encoded-cookie
   "Inserts the provided name-value pair as a Set-Cookie header in the response"
   [response password name value age-in-days]
-  (letfn [(add-cookie-into-response [response]
+  (letfn [(add-cookie-header [response]
             (let [encoded-cookie (-> (encode-cookie value password)
                                      UrlEncoded/encodeString)
                   max-age (-> age-in-days t/days t/in-seconds)
@@ -69,9 +70,13 @@
                                (string? existing-header) [existing-header set-cookie-header]
                                :else (conj existing-header set-cookie-header))]
               (assoc-in response [:headers "set-cookie"] new-header)))]
-    (if (map? response)
-      (add-cookie-into-response response)
-      (async/go (add-cookie-into-response (async/<! response))))))
+    (cond
+      (au/chan? response) (async/go (let [ret (async/<! response)]
+                                      (if (utils/throwable? ret)
+                                        (utils/wrap-throwable ret add-cookie-header)
+                                        (add-cookie-header ret))))
+      (utils/throwable? response) (utils/wrap-throwable response add-cookie-header)
+      :else (add-cookie-header response))))
 
 (defn decode-cookie
   "Decode Waiter encoded cookie."

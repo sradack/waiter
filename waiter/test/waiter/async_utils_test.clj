@@ -14,7 +14,8 @@
             [clojure.tools.logging :as log]
             [full.async :refer (<?? <? go-try)]
             [metrics.histograms :as histograms]
-            [waiter.async-utils :refer :all]))
+            [waiter.async-utils :refer :all]
+            [waiter.utils :as utils]))
 
 (deftest test-sliding-buffer-chan
   (let [buf-size 4
@@ -300,3 +301,39 @@
     (test-priority-data out 5)
     (test-priority-data out 2)
     (test-priority-data out 4)))
+
+(deftest test-chan?
+  (is (chan? (async/chan)))
+  (is (not (chan? nil)))
+  (is (not (chan? ""))))
+
+(deftest test-wrap-sync
+  (testing "sync resp, sync body"
+    (let [handler (-> (fn [request] {:body "hello"})
+                      wrap-sync)]
+      (is (= {:body "hello"} (handler {})))))
+
+  (testing "sync resp, async body"
+    (let [handler (-> (fn [request] {:body (async/go "hello")})
+                      wrap-sync)]
+      (is (= {:body "hello"} (handler {})))))
+
+  (testing "async resp, sync body"
+    (let [handler (-> (fn [request] (async/go {:body "hello"}))
+                      wrap-sync)]
+      (is (= {:body "hello"} (handler {})))))
+
+  (testing "async resp, async body"
+    (let [handler (-> (fn [request] (async/go {:body (async/go "hello")}))
+                      wrap-sync)]
+      (is (= {:body "hello"} (handler {})))))
+
+  (testing "sync exception"
+    (let [handler (-> (fn [request] (throw (ex-info "bad" {}) ))
+                      wrap-sync)]
+      (is (thrown? Throwable (handler {})))))
+
+  (testing "async exception"
+    (let [handler (-> (fn [request] (async/go (ex-info "bad" {}) ))
+                      wrap-sync)]
+      (is (utils/throwable? (handler {}))))))

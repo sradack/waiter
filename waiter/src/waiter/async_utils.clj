@@ -14,7 +14,8 @@
             [clojure.tools.logging :as log]
             [metrics.core]
             [metrics.histograms :as histograms]
-            [slingshot.slingshot :refer [throw+ try+]]))
+            [slingshot.slingshot :refer [throw+ try+]]
+            [waiter.utils :as utils]))
 
 (defn sliding-buffer-chan [n]
   (async/chan (async/sliding-buffer n)))
@@ -176,3 +177,30 @@
           (ex-handler e)
           (log/error e "Fatal exception in timing-out-pipeline"))))
     out))
+
+(defn chan?
+  "Determines if something is a chan."
+  [o]
+  (instance? clojure.core.async.impl.channels.ManyToManyChannel o))
+
+(defn sync-response
+  "Synchronizes a response, converting a response chan to a response
+  and a body chan to just the body."
+  [resp]
+  (let [sync-resp (if (chan? resp)
+                    (async/<!! resp)
+                    resp)]
+    (if (utils/throwable? sync-resp)
+      sync-resp
+      (let [{:keys [body]} sync-resp]
+        (if (chan? body)
+          (update sync-resp :body async/<!!)
+          sync-resp)))))
+
+(defn wrap-sync
+  "Wraps a handler, whether synchronous or asyncronous, and returns a response
+  map (or exception) and a body that aren't channels.  This method blocks."
+  [handler]
+  (fn [request]
+    (-> (handler request)
+        sync-response)))

@@ -12,6 +12,7 @@
   (:require [clj-time.core :as t]
             [clojure.string :as str]
             [clojure.tools.logging :as log]
+            [full.async :as fa]
             [waiter.cookie-support :as cookie-support]))
 
 (def ^:const AUTH-COOKIE-NAME "x-waiter-auth")
@@ -35,14 +36,20 @@
   (cookie-support/add-encoded-cookie response password AUTH-COOKIE-NAME [principal (System/currentTimeMillis)] 1))
 
 (defn handle-request-auth
-  "Invokes the given request-handler on the given request, adding the necessary
+  "Invokes the given handler on the given request, adding the necessary
   auth headers on the way in, and the x-waiter-auth cookie on the way out."
   [request-handler request user principal password]
-  (-> request
-      (assoc :authorization/user user
-             :authenticated-principal principal)
-      request-handler
-      (add-cached-auth password principal)))
+  (let [handler (fn [request]
+                  (try
+                    (request-handler request)
+                    (catch Throwable t
+                      t)))]
+    (-> request
+        (assoc :authorization/user user
+               :authenticated-principal principal)
+        handler
+        (add-cached-auth password principal)
+        fa/throw-if-throwable)))
 
 (defn decode-auth-cookie
   "Decodes the provided cookie using the provided password.

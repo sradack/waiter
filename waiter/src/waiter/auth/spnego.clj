@@ -17,8 +17,10 @@
             [metrics.meters :as meters]
             [ring.middleware.cookies :as cookies]
             [ring.util.response :as rr]
+            [waiter.async-utils :as au]
             [waiter.auth.authentication :as auth]
-            [waiter.metrics :as metrics])
+            [waiter.metrics :as metrics]
+            [waiter.utils :as utils])
   (:import (org.apache.commons.codec.binary Base64)
            (org.eclipse.jetty.client.api Authentication$Result Request)
            (org.eclipse.jetty.http HttpHeader)
@@ -71,14 +73,14 @@
   [^GSSContext gss]
   (str (.getSrcName gss)))
 
-(defn require-gss
+(defn wrap-spnego
   "This middleware enables the application to require a SPNEGO
    authentication. If SPNEGO is successful then the handler `request-handler`
    will be run, otherwise the handler will not be run and 401
    returned instead.  This middleware doesn't handle cookies for
    authentication, but that should be stacked before this handler."
   [request-handler password]
-  (fn require-gss-handler [{:keys [headers] :as req}]
+  (fn wrap-spnego-fn [{:keys [headers] :as req}]
     (let [waiter-cookie (auth/get-auth-cookie-value (get headers "cookie"))
           [auth-principal _ :as decoded-auth-cookie] (auth/decode-auth-cookie waiter-cookie password)]
       (cond
@@ -93,13 +95,19 @@
           (if (.isEstablished gss_context)
             (let [principal (gss-get-princ gss_context)
                   user (first (str/split principal #"@" 2))
-                  resp (auth/handle-request-auth request-handler req user principal password)]
+                  resp (try (auth/handle-request-auth request-handler req user principal password)
+                            (catch Throwable t
+                              t))
+                  add-header-fn (fn [response] (rr/header response "WWW-Authenticate" token))]
               (log/debug "added cookies to response")
               (if token
-                (if (map? resp)
-                  (rr/header resp "WWW-Authenticate" token)
-                  (async/go
-                    (rr/header (async/<! resp) "WWW-Authenticate" token)))
+                (cond (au/chan? resp) (async/go
+                                        (let [ret (async/<! resp)]
+                                          (if (utils/throwable? ret)
+                                            (utils/wrap-throwable ret add-header-fn)
+                                            (add-header-fn ret))))
+                      (utils/throwable? resp) (add-header-fn resp)
+                      :else (add-header-fn resp))
                 resp))
             (response-401-negotiate)))
         ;; Default to unauthorized

@@ -748,7 +748,7 @@
 
 (deftest test-async-result-handler-call
   (testing "test-async-result-handler-call"
-    (with-redefs [cors/handler (fn [handler _] handler)]
+    (with-redefs [cors/wrap-cors (fn [handler _] handler)]
       (let [request {:authorization/user "test-user"
                      :request-method :get
                      :uri "/waiter-async/result/test-request-id/test-router-id/test-service-id/test-host/test-port/some/test/location"}
@@ -767,7 +767,7 @@
 
 (deftest test-async-status-handler-call
   (testing "test-async-status-handler-call"
-    (with-redefs [cors/handler (fn [handler _] handler)]
+    (with-redefs [cors/wrap-cors (fn [handler _] handler)]
       (let [request {:authorization/user "test-user"
                      :request-method :get
                      :uri "/waiter-async/status/test-request-id/test-router-id/test-service-id/test-host/test-port/some/test/location"}
