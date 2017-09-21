@@ -195,13 +195,11 @@
 
 (defn- wrap-exception
   "Includes metadata such as cid and status along with the exception."
-  [exception instance message status headers]
+  [exception instance message status]
   (ex-info message
            (merge (metrics/retrieve-local-stats-for-service (scheduler/instance->service-id instance))
                   {:instance instance
-                   :cid (cid/get-correlation-id)
-                   :status status
-                   :headers headers})
+                   :status status})
            exception))
 
 (defn http-method-fn
@@ -454,7 +452,8 @@
       (track-process-error-metrics-fn descriptor)
       (when descriptor
         (let [{:keys [service-description service-id]} descriptor]
-          (track-response-status-metrics service-id service-description (or (-> exception ex-data :status) 500)))))))
+          (track-response-status-metrics service-id service-description (or (-> exception ex-data :status) 500))))
+      (throw exception))))
 
 (defn track-process-error-metrics
   "Updates metrics for process errors."
@@ -485,7 +484,7 @@
           add-debug-header-into-response! (fn [name value]
                                            (when waiter-debug-enabled?
                                              (swap! response-headers assoc (str name) (str value))))]
-      (async/go
+      (go-try
         (if waiter-debug-enabled?
           (log/info "process request to" (get-in request [:headers "host"]) "at path" (:uri request))
           (log/debug "process request to" (get-in request [:headers "host"]) "at path" (:uri request)))
@@ -495,6 +494,7 @@
             (confirm-live-connection-without-abort)
             (let [{:keys [service-id service-description] :as descriptor} (request->descriptor-fn request)
                   {:strs [metric-group]} service-description]
+              ;TODO FIX
               (loop [[handler & remaining-handlers] handlers]
                 (if handler
                   (let [response (handler request descriptor)]
@@ -556,21 +556,21 @@
                                         (deliver reservation-status-promise :client-error)
                                         (throw (wrap-exception error instance 
                                                                "Connection unexpectedly closed while sending request"
-                                                               400 @response-headers)))
+                                                               400)))
                                       
                                       (instance? TimeoutException error)
                                       (do
                                         (deliver reservation-status-promise :instance-error)
                                         (throw (wrap-exception error instance 
                                                                (utils/message :backend-request-timed-out)
-                                                               504 @response-headers)))
+                                                               504)))
 
                                       :else
                                       (do
                                         (deliver reservation-status-promise :instance-error)
                                         (throw (wrap-exception error instance 
                                                                (utils/message :backend-request-failed)
-                                                               502 @response-headers)))))
+                                                               502)))))
                               (process-backend-response-fn instance-request-properties descriptor instance request
                                                            reason-map response-headers reservation-status-promise
                                                            confirm-live-connection-with-abort request-state-chan response))
@@ -586,10 +586,10 @@
                       (throw (ex-info "Rethrowing exception from process" {:descriptor descriptor :source :pr/process} e)))))))
             (catch Exception e
               (let [{:keys [descriptor source]} (ex-data e)
-                    exception (if (= source :pr/process) (.getCause e) e)]
-                (-> (process-exception-fn track-process-error-metrics request descriptor exception)
-                    (update :headers (fn [headers] 
-                                       (merge @response-headers headers))))))))))))
+                    exception (-> (if (= source :pr/process) (.getCause e) e)
+                                  (utils/wrap-throwable #(update % :headers merge @response-headers)))]
+                (log/error "Error during process" e)
+                (process-exception-fn track-process-error-metrics request descriptor exception)))))))))
 
 (defn handle-suspended-service
   "Check if a service has been suspended and immediately return a 503 response"

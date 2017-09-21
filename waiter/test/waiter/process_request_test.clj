@@ -17,6 +17,7 @@
             [plumbing.core :as pc]
             [qbits.jet.client.http :as http]
             [waiter.core :refer :all]
+            [waiter.error-handling :as error-handling]
             [waiter.headers :as headers]
             [waiter.kv :as kv]
             [waiter.metrics :as metrics]
@@ -502,10 +503,12 @@
 
 (deftest test-handle-suspended-service
   (testing "returns error for suspended app"
-    (let [{:keys [status body]} (handle-suspended-service nil {:service-id "service-id-1"
-                                                               :suspended-state {:suspended true
-                                                                                 :last-updated-by "suser"
-                                                                                 :time (t/now)}})]
+    (let [handler (-> (fn [request]
+                        (handle-suspended-service request {:service-id "service-id-1"
+                                                           :suspended-state {:suspended true
+                                                                             :last-updated-by "suser" :time (t/now)}})) 
+                      (error-handling/wrap-error-handling {}))
+          {:keys [status body]} (handler nil)]
       (is (= 503 status))
       (is (str/includes? body "Service has been suspended"))
       (is (str/includes? body "suser"))))
@@ -515,20 +518,26 @@
 (deftest test-handle-too-many-requests
   (testing "returns error for too many requests"
     (let [service-id "myservice"
-          counter (metrics/service-counter service-id "request-counts" "waiting-for-available-instance")]
+          counter (metrics/service-counter service-id "request-counts" "waiting-for-available-instance")
+          handler (-> (fn [request]
+                        (handle-too-many-requests request {:service-id service-id
+                                                           :service-description {"max-queue-length" 5}}))
+                      (error-handling/wrap-error-handling {}))]
       (counters/clear! counter)
       (counters/inc! counter 10)
-      (let [{:keys [status body]} (handle-too-many-requests nil {:service-id service-id
-                                                                 :service-description {"max-queue-length" 5}})]
+      (let [{:keys [status body]} (handler nil)]
         (is (= 503 status))
         (is (str/includes? body "Max queue length")))))
   (testing "passes service with fewer requests"
     (let [service-id "okservice"
-          counter (metrics/service-counter service-id "request-counts" "waiting-for-available-instance")]
+          counter (metrics/service-counter service-id "request-counts" "waiting-for-available-instance")
+          handler (-> (fn [request]
+                        (handle-too-many-requests request {:service-id service-id
+                                                           :service-description {"max-queue-length" 10}}))
+                      (error-handling/wrap-error-handling {}))]
       (counters/clear! counter)
       (counters/inc! counter 3)
-      (is (nil? (handle-too-many-requests nil {:service-id service-id
-                                               :service-description {"max-queue-length" 10}}))))))
+      (is (nil? (handler nil))))))
 
 (deftest test-missing-run-as-user?
   (let [exception (ex-info "Test exception" {})]
@@ -596,8 +605,11 @@
         request->descriptor-fn (fn [_] (throw (Exception. "Exception message")))
         request {:ctrl ctrl-chan, :headers {"host" "www.example.com:1234"}}
         request-abort-callback-factory (fn [_] (constantly nil))
-        response-chan (process "router-id" nil nil request->descriptor-fn nil {} [] nil nil nil
-                               process-exception-in-http-request request-abort-callback-factory request)
+        handler (-> (fn [request] 
+                      (process "router-id" nil nil request->descriptor-fn nil {} [] nil nil nil
+                               process-exception-in-http-request request-abort-callback-factory request))
+                    (error-handling/wrap-error-handling {}))
+        response-chan (handler request)
         {:keys [body headers status] :as response} (async/<!! response-chan)]
     (is (= 500 status))
     (is (nil? (get headers "location")))
@@ -609,8 +621,11 @@
         request->descriptor-fn (fn [_] (throw (ex-info "Error message for user" {:status 404})))
         request {:ctrl ctrl-chan, :headers {"host" "www.example.com:1234"}}
         request-abort-callback-factory (fn [_] (constantly nil))
-        response-chan (process "router-id" nil nil request->descriptor-fn nil {} [] nil nil nil
-                               process-exception-in-http-request request-abort-callback-factory request)
+        handler (-> (fn [request]
+                      (process "router-id" nil nil request->descriptor-fn nil {} [] nil nil nil
+                               process-exception-in-http-request request-abort-callback-factory request))
+                    (error-handling/wrap-error-handling {}))
+        response-chan (handler request) 
         {:keys [body headers status] :as response} (async/<!! response-chan)]
     (is (= 404 status))
     (is (= "text/plain" (get headers "content-type")))

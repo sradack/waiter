@@ -99,18 +99,18 @@
 
 (defn wrap-error-handling
   "Handles uncaught exceptions, writing an HTTP response that is content-negotiated.
-   Handles both synchronous and asynchronous handlers."
+  Handles both synchronous and asynchronous handlers."
   [handler support-info]
   (fn wrap-error-handling-fn [request]
     (try 
       (let [ret (handler request)]
-        (if (map? ret)
-          ret
-          (async/go 
-            (let [async-ret (async/<! ret)]
-              (if (instance? Exception async-ret)
-                (exception->response async-ret support-info request)
-                async-ret)))))
-      (catch Exception ex
+        (cond (map? ret) ret
+              (nil? ret) nil
+              :else (async/go 
+                      (let [async-ret (async/<! ret)]
+                        (if (instance? Throwable async-ret)
+                          (exception->response async-ret support-info request)
+                          async-ret)))))
+      (catch Throwable ex
         (exception->response ex support-info request)))))
 

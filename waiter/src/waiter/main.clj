@@ -71,13 +71,13 @@
                          handlers] ; Insist that all systems are running before we start server
                   (let [options (merge websocket-config
                                        {:ring-handler (-> (core/ring-handler-factory waiter-request?-fn handlers)
-                                                          core/correlation-id-middleware
                                                           (error-handling/wrap-error-handling support-info)
+                                                          core/correlation-id-middleware
                                                           consume-request-stream)
                                         :websocket-acceptor websocket-request-authenticator
                                         :websocket-handler (-> (core/websocket-handler-factory handlers)
-                                                               core/correlation-id-middleware
-                                                               (error-handling/wrap-error-handling support-info))
+                                                               (error-handling/wrap-error-handling support-info)
+                                                               core/correlation-id-middleware)
                                         :host host
                                         :join? false
                                         :max-threads 250

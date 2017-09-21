@@ -394,3 +394,16 @@
   "Parses the request header to determine if debug mode has been enabled."
   [request]
   (boolean (get-in request [:headers "x-waiter-debug"])))
+
+(defn wrap-throwable
+  "Wrap an exception, calling `f` on any existing ex-data."
+  [^Throwable t f]
+  (when (instance? Throwable t)
+    (ex-info (.getMessage t) 
+             (f (or (ex-data t) {}))
+             t)))
+
+(defn throwable?
+  "Determines whether something is a Throwable"
+  [t]
+  (instance? Throwable t))

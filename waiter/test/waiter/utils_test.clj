@@ -514,3 +514,17 @@
       (is (false? (port-available? port)))
       (.close ss))
     (is (port-available? port))))
+
+(deftest test-wrap-throwable
+  (let [t (wrap-throwable (ex-info "test" {:a 1 :b 2}) (fn [m] (merge m {:a 0 :c 3})))
+        {:keys [a b c]} (ex-data t)]
+    (is (= 0 a))
+    (is (= 2 b))
+    (is (= 3 3))
+    (is (= "test" (.getMessage t)))))
+
+(deftest test-throwable?
+  (is (throwable? (ex-info "test" {})))
+  (is (throwable? (java.lang.RuntimeException. "test")))
+  (is (not (throwable? nil)))
+  (is (not (throwable? "ok"))))

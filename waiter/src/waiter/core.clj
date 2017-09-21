@@ -970,10 +970,12 @@
                                                                   (partial router-comm-authenticated? router-id passwords))]
                                          (basic-auth-handler request))))
    :handle-secure-request-fn (pc/fnk [[:routines authentication-method-wrapper-fn]
-                                      [:state cors-validator]]
+                                      [:state cors-validator]
+                                      wrap-error-handling-fn]
                                (fn handle-secure-request-fn [request-handler {:keys [uri] :as request}]
                                  (log/debug "secure request received at" uri)
                                  (let [handler (-> request-handler
+                                                   wrap-error-handling-fn
                                                    (cors/handler cors-validator)
                                                    authentication-method-wrapper-fn)]
                                    (handler request))))
@@ -1177,6 +1179,9 @@
                                                 token->service-description-template service-description->service-id
                                                 consent-expiry-days request))
                                             request)))
+   :wrap-error-handling-fn (pc/fnk [[:settings support-info]]
+                             (fn [handler] 
+                               (error-handling/wrap-error-handling handler support-info)))
    :work-stealing-handler-fn (pc/fnk [[:state instance-rpc-chan]
                                       handle-inter-router-request-fn]
                                (fn work-stealing-handler-fn [request]

@@ -21,6 +21,7 @@
       (let [{:keys [body headers status]} 
             (exception->response 
               (ex-info "TestCase Exception" {:status 400})
+              {}
               (assoc-in request [:headers "accept"] "text/html"))]
         (is (= 400 status))
         (is (= {"content-type" "text/html"} headers))
@@ -30,6 +31,7 @@
             (exception->response 
               (ex-info "TestCase Exception" {:status 400
                                              :friendly-error-message "See http://localhost/path"})
+              {}
               (assoc-in request [:headers "accept"] "text/html"))]
         (is (= 400 status))
         (is (= {"content-type" "text/html"} headers))
@@ -38,6 +40,7 @@
       (let [{:keys [body headers status]}
             (exception->response
               (ex-info "TestCase Exception" {:status 400})
+              {}
               (assoc-in request [:headers "accept"] "text/plain"))]
         (is (= 400 status))
         (is (= {"content-type" "text/plain"} headers))
@@ -46,6 +49,7 @@
       (let [{:keys [body headers status]}
             (exception->response 
               (ex-info "TestCase Exception" {:status 500})
+              {}
               (assoc-in request [:headers "accept"] "application/json"))]
         (is (= 500 status))
         (is (= {"content-type" "application/json"} headers))

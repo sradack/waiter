@@ -41,10 +41,12 @@
 
 (defn- run-handle-token-request
   [kv-store waiter-hostname entitlement-manager make-peer-requests-fn validate-service-description-fn request]
-  (let [handle-token-request-fn (-> handle-token-request
-                                    (error-handling/wrap-error-handling {}))]
-    (handle-token-request-fn clock synchronize-fn kv-store waiter-hostname entitlement-manager make-peer-requests-fn
-                             validate-service-description-fn request)))
+  (let [handler (-> (fn [request]
+                      (handle-token-request clock synchronize-fn kv-store waiter-hostname
+                                            entitlement-manager make-peer-requests-fn
+                                            validate-service-description-fn request))
+                    (error-handling/wrap-error-handling {}))]
+    (handler request)))
 
 (deftest test-handle-token-request
   (with-redefs [sd/service-description->service-id (fn [prefix sd] (str prefix (hash (select-keys sd sd/service-description-keys))))]
@@ -61,7 +63,10 @@
                                  {:cmd "tc2", :cpus 2, :mem 400, :version "d1e2f3", :run-as-user "tu1", :permitted-user "tu3", :token token})
           service-id2 (sd/service-description->service-id service-id-prefix service-description2)
           waiter-hostname "waiter-hostname.app.example.com"
-          handle-list-tokens-request (-> handle-list-tokens-request wrap-handler-json-response (error-handling/wrap-error-handling {}))]
+          list-handler (-> (fn [request]
+                             (handle-list-tokens-request kv-store request))
+                           wrap-handler-json-response
+                           (error-handling/wrap-error-handling {}))]
 
       (testing "delete:no-token-in-request"
         (let [{:keys [status body]}
@@ -214,9 +219,7 @@
 
       (testing "test:list-tokens"
         (let [{:keys [status body]}
-              (handle-list-tokens-request
-                kv-store
-                {:request-method :get, :authorization/user "tu1"})]
+              (list-handler {:request-method :get, :authorization/user "tu1"})]
           (is (= 200 status))
           (is (= [{"token" token "owner" "tu1"}] (json/read-str body)))))
 
@@ -710,9 +713,11 @@
                                       (is (= "tokens/refresh" path))
                                       (is index)
                                       (reset! inter-router-request-fn-called true)))
-          {:keys [status body]} (handle-reindex-tokens-request
-                                  synchronize-fn inter-router-request-fn kv-store list-tokens-fn
-                                  {:request-method :post})
+          handler (-> (fn [request]
+                        (handle-reindex-tokens-request
+                          synchronize-fn inter-router-request-fn kv-store list-tokens-fn request))
+                      (error-handling/wrap-error-handling {}))
+          {:keys [status body]} (handler {:request-method :post})
           json-response (json/read-str body)]
       (is (= 200 status))
       (is (= {:message "Successfully re-indexed" :tokens 3} (-> json-response clojure.walk/keywordize-keys)))
@@ -720,9 +725,11 @@
 
     (let [inter-router-request-fn-called (atom nil)
           inter-router-request-fn (fn [] (reset! inter-router-request-fn-called true))
-          {:keys [status body]} (handle-reindex-tokens-request 
-                                  synchronize-fn inter-router-request-fn kv-store list-tokens-fn
-                                  {:headers {"accept" "application/json"}, :request-method :get})
+          handler (-> (fn [request]
+                        (handle-reindex-tokens-request
+                          synchronize-fn inter-router-request-fn kv-store list-tokens-fn request))
+                      (error-handling/wrap-error-handling {}))
+          {:keys [status body]} (handler {:headers {"accept" "application/json"}, :request-method :get})
           json-response (json/read-str body)]
       (is (= 405 status))
       (is (not @inter-router-request-fn-called)))))
@@ -733,30 +740,37 @@
                          (locking lock
                            (f)))
         kv-store (kv/->LocalKeyValueStore (atom {}))
-        handle-list-tokens-request (-> handle-list-tokens-request wrap-handler-json-response (error-handling/wrap-error-handling {}))]
+        handler (-> (fn [request]
+                      (handle-list-tokens-request kv-store request))
+                    wrap-handler-json-response
+                    (error-handling/wrap-error-handling {}))]
     (store-service-description-for-token synchronize-fn kv-store "token1" {} {"owner" "owner1"})
     (store-service-description-for-token synchronize-fn kv-store "token2" {} {"owner" "owner1"})
     (store-service-description-for-token synchronize-fn kv-store "token3" {} {"owner" "owner2"})
-    (let [{:keys [body status]} (handle-list-tokens-request kv-store {:request-method :get})]
+    (let [{:keys [body status]} (handler {:request-method :get})]
       (is (= 200 status))
       (is (= #{{"owner" "owner1", "token" "token1"}
                {"owner" "owner1", "token" "token2"}
                {"owner" "owner2", "token" "token3"}} (set (json/read-str body)))))
-    (let [{:keys [body status]} (handle-list-tokens-request kv-store {:request-method :get :query-string "owner=owner1"})]
+    (let [{:keys [body status]} (handler {:request-method :get
+                                          :query-string "owner=owner1"})]
       (is (= 200 status))
       (is (= #{{"owner" "owner1", "token" "token1"}
                {"owner" "owner1", "token" "token2"}} (set (json/read-str body)))))
-    (let [{:keys [status body]} (handle-list-tokens-request kv-store {:headers {"accept" "application/json"}
-                                                                      :request-method :post})
+    (let [{:keys [status body]} (handler {:headers {"accept" "application/json"}
+                                          :request-method :post})
           json-response (try (json/read-str body)
                              (catch Exception _
                                (is (str "Failed to parse body as JSON:\n" body))))]
       (is (= 405 status)))
-    (let [{:keys [body status]} (handle-list-tokens-request kv-store {:request-method :get :query-string "owner=owner2"})]
+    (let [{:keys [body status]} (handler {:request-method :get
+                                          :query-string "owner=owner2"})]
       (is (= 200 status))
       (is (= #{{"owner" "owner2", "token" "token3"}} (set (json/read-str body)))))
-    (let [{:keys [body]} (handle-list-token-owners-request kv-store {:headers {"accept" "application/json"}
-                                                                     :request-method :get})
-          owner-map-keys (keys (json/read-str body))]
-      (is (some #(= "owner1" %) owner-map-keys) "Should have had a key 'owner1'")
-      (is (some #(= "owner2" %) owner-map-keys) "Should have had a key 'owner2'"))))
+    (let [{:keys [body]} (handler {:headers {"accept" "application/json"}
+                                   :request-method :get})
+          token-map (into {} (map (fn [{:strs [token owner]}] [token owner])
+                                  (json/read-str body)))]
+      (is (= {"token1" "owner1"
+              "token2" "owner1"
+              "token3" "owner2"} token-map)))))
